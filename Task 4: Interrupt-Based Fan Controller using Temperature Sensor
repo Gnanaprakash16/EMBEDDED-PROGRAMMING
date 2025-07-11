@@ -1,0 +1,125 @@
+#include <stdint.h>
+
+// RCC
+#define RCC_BASE         0x40021000UL
+#define RCC_IOPENR       (*(volatile uint32_t*)(RCC_BASE + 0x34))
+#define RCC_APB2ENR      (*(volatile uint32_t*)(RCC_BASE + 0x18))
+
+// GPIOC
+#define GPIOC_BASE       0x50000800UL
+#define GPIOC_MODER      (*(volatile uint32_t*)(GPIOC_BASE + 0x00))
+#define GPIOC_ODR        (*(volatile uint32_t*)(GPIOC_BASE + 0x14))
+#define GPIOC_IDR        (*(volatile uint32_t*)(GPIOC_BASE + 0x10))
+
+// ADC
+#define ADC_BASE         0x40012400UL
+#define ADC_ISR          (*(volatile uint32_t*)(ADC_BASE + 0x00))
+#define ADC_CR           (*(volatile uint32_t*)(ADC_BASE + 0x08))
+#define ADC_CFGR1        (*(volatile uint32_t*)(ADC_BASE + 0x0C))
+#define ADC_CHSELR       (*(volatile uint32_t*)(ADC_BASE + 0x28))
+#define ADC_CCR          (*(volatile uint32_t*)(ADC_BASE + 0x308))
+#define ADC_DR           (*(volatile uint32_t*)(ADC_BASE + 0x40))
+
+// Factory calibration
+#define TS_CAL1          *((uint16_t*)0x1FFF75A8) // 30°C
+#define TS_CAL2          *((uint16_t*)0x1FFF75CA) // 110°C
+
+// EXTI
+#define EXTI_BASE        0x40021800UL
+#define EXTI_IMR1        (*(volatile uint32_t*)(EXTI_BASE + 0x00))
+#define EXTI_RTSR1       (*(volatile uint32_t*)(EXTI_BASE + 0x08))
+#define EXTI_PR1         (*(volatile uint32_t*)(EXTI_BASE + 0x14))
+
+// SYSCFG
+#define SYSCFG_BASE      0x40010000UL
+#define SYSCFG_EXTICR4   (*(volatile uint32_t*)(SYSCFG_BASE + 0x10))
+
+// NVIC
+#define NVIC_ISER0       (*(volatile uint32_t*)0xE000E100)
+
+volatile uint8_t manual_override = 0;
+volatile uint8_t fan_on = 0;
+
+// Simple delay
+void delay(volatile uint32_t t) {
+    while (t--) {
+        for (volatile uint32_t i = 0; i < 1000; i++);
+    }
+}
+
+// ADC init for temp sensor
+void adc_init(void) {
+    RCC_APB2ENR |= (1 << 9);     // Enable ADC clock
+    ADC_CCR |= (1 << 23);        // Enable temperature sensor
+    ADC_CR |= (1 << 0);          // Enable ADC
+    while (!(ADC_ISR & (1 << 0))); // Wait until ready
+}
+
+// Read ADC temperature sensor value
+uint16_t adc_read_temp(void) {
+    ADC_CHSELR = (1 << 16); // Select channel 16 (temp sensor)
+    ADC_CR |= (1 << 2);     // Start conversion
+    while (!(ADC_ISR & (1 << 2))); // Wait EOC
+    return (uint16_t)ADC_DR;
+}
+
+// Calculate temperature (°C)
+uint32_t calculate_temp(uint16_t adc_val) {
+    int32_t temp = ((int32_t)(adc_val - TS_CAL1) * (110 - 30));
+    temp = temp / (TS_CAL2 - TS_CAL1);
+    temp += 30;
+    return (uint32_t)temp;
+}
+
+// EXTI4_15 IRQ Handler for PC13 (EXTI13)
+void EXTI4_15_IRQHandler(void) {
+    if (EXTI_PR1 & (1 << 13)) {
+        EXTI_PR1 |= (1 << 13); // clear pending
+        manual_override ^= 1;  // toggle manual override
+        fan_on ^= 1;           // toggle fan state manually
+        if (fan_on) {
+            GPIOC_ODR |= (1 << 6);
+        } else {
+            GPIOC_ODR &= ~(1 << 6);
+        }
+    }
+}
+
+int main(void) {
+    // Enable GPIOC clock
+    RCC_IOPENR |= (1 << 2);
+
+    // PC6 as output (fan/LED), PC13 as input
+    GPIOC_MODER &= ~(0x3 << (6*2));  // clear
+    GPIOC_MODER |=  (0x1 << (6*2));  // output
+
+    GPIOC_MODER &= ~(0x3 << (13*2)); // input (default)
+
+    // ADC init
+    adc_init();
+
+    // Configure EXTI for PC13
+    RCC_APB2ENR |= (1 << 0);        // Enable SYSCFG
+    SYSCFG_EXTICR4 &= ~(0xF << 4);  // Map EXTI13 to PC13
+
+    EXTI_IMR1 |= (1 << 13);         // Unmask EXTI13
+    EXTI_RTSR1 |= (1 << 13);        // Rising edge trigger
+
+    NVIC_ISER0 |= (1 << 7);         // Enable EXTI4_15 interrupt in NVIC
+
+    while (1) {
+        if (!manual_override) {
+            uint16_t adc_val = adc_read_temp();
+            uint32_t temp_c = calculate_temp(adc_val);
+
+            if (temp_c > 40) {
+                GPIOC_ODR |= (1 << 6); // Fan ON
+                fan_on = 1;
+            } else {
+                GPIOC_ODR &= ~(1 << 6); // Fan OFF
+                fan_on = 0;
+            }
+        }
+        delay(1000);
+    }
+}
